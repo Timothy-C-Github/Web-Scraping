@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 import csv
 import os
 import logging
+import re
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -43,10 +44,14 @@ def extract_basic_profile_info(soup):
     profile_data = {
         "name": None,
         "level": None,
-        "country": None,
+        "location": None,
         "status": None,
         "avatar_url": None,
         "background_url": None,
+        "number_of_badges": None,
+        "total_games": None,
+        "recent_activity": None,
+        "profile_description": None,
     }
 
     # Extract profile name
@@ -63,9 +68,9 @@ def extract_basic_profile_info(soup):
             logging.warning("Failed to parse profile level.")
 
     # Extract country
-    country_img = soup.find("img", class_="profile_flag")
-    if country_img and country_img.next_sibling:
-        profile_data["country"] = country_img.next_sibling.strip()
+    location_img = soup.find("img", class_="profile_flag")
+    if location_img and location_img.next_sibling:
+        profile_data["location"] = location_img.next_sibling.strip()
 
     # Extract online status
     status_div = soup.find("div", class_="profile_in_game_header")
@@ -87,7 +92,43 @@ def extract_basic_profile_info(soup):
             source = bg_video.find("source")
             if source:
                 profile_data["background_url"] = source.get("src")
+    
+    # Extract total number of badges
+    badge_container = soup.find("div", class_="profile_badges").find("span", class_="profile_count_link_total").text.strip()
+    if badge_container:
+        profile_data["number_of_badges"] = badge_container
 
+    # Extract total number of games
+    # First method: from individual games tab.
+    games_tab = soup.find("div", class_="profile_item_links").find("a", href=lambda x: x and 'games/?tab=all' in x)
+    if games_tab:
+        tot_games = games_tab.find("span", class_="profile_count_link_total").text.strip()
+        profile_data["total_games"] = tot_games
+    # Second method: from badges
+    badge_games = soup.find('div', class_='profile_badges').find("div", class_="profile_count_link_preview").find_all("div", class_="profile_badges_badge")
+    for badge in badge_games:
+        tooltip = badge.get('data-tooltip-html', '')
+        if "games owned" in tooltip:
+            games_badge = re.sub('\D', '', str(tooltip))
+            profile_data["total_games"] = games_badge
+            break  # Stop after finding the correct badge
+    
+    # Extract recent activity
+    recent_activity = soup.find("div", class_="recentgame_quicklinks recentgame_recentplaytime")
+    if recent_activity:
+        profile_data["recent_activity"] = recent_activity.text.strip("\n")
+    if profile_data["recent_activity"] == None:
+        profile_data["recent_activity"] = "N/A"
+        
+    # Extract profile description
+    profile_description = soup.find("div", class_="profile_summary")
+    if profile_description:
+        profile_data["profile_description"] = profile_description.text.strip()
+    if profile_data["profile_description"] == None:
+        profile_data["profile_description"] = "N/A"
+    
+    
+    
     return profile_data
 
 def extract_games_and_playtime(soup):
@@ -135,21 +176,30 @@ def extract_friends(soup):
     Returns:
         tuple: (list of friends, total friends count)
     """
-    friends = []
-    total_friends = None
+    friends_names = []
+    friends_links = []
+    friends_status = []
+    friends_in_game = []
+    total_friends = (soup.find("div", class_="profile_friend_links profile_count_link_preview_ctn responsive_groupfriends_element").find("span", class_="profile_count_link_total")).text.strip()
 
-    friends_list = soup.find_all("div", class_="friendBlock")
+    friends_list = soup.find("div", class_="profile_topfriends profile_count_link_preview")
+    friends_list = friends_list.select("div[class^='friendBlock persona']")
     for friend in friends_list:
-        friend_content = friend.find("div", class_="friendBlockContent")
-        friend_status_span = friend.find("span", class_="friendSmallText")
-
-        if friend_content and friend_content.contents:
-            friend_name = friend_content.contents[0].strip()
-            friend_status = friend_status_span.text.strip() if friend_status_span else "Unknown"
-            friends.append({"name": friend_name, "status": friend_status})
-            total_friends += 1
-
-    return friends, total_friends
+        friend_content = friend.find("a")
+        friends_links.append(friend_content["href"])
+        friend_name = friend.find("div", class_="friendBlockContent").text.strip().split("\n")
+        friends_names.append(friend_name[0])
+        
+        
+        if "In-Game" in friend_name[2].strip():
+            in_game = friend_name[2].strip()
+            friends_status.append("In-Game")
+            friends_in_game.append(re.split(r"In-Game", in_game, maxsplit=1)[1])
+        elif "In-Game" not in friend_name[2].strip():
+            friends_status.append(friend_name[2].strip())
+            friends_in_game.append(None)
+    
+    return total_friends, friends_names, friends_links, friends_status, friends_in_game
 
 def extract_years_of_service(soup):
     """
@@ -198,12 +248,18 @@ def scrape_steam_profile(input_text):
         # Extract games and playtime
         games, total_playtime_hours_on_recent_games = extract_games_and_playtime(soup)
         profile_data["games"] = games
+        if total_playtime_hours_on_recent_games == 0:
+            total_playtime_hours_on_recent_games = "N/A"
         profile_data["total_playtime_hours_on_recent_games"] = total_playtime_hours_on_recent_games
 
         # Extract friends
-        friends, total_friends = extract_friends(soup)
-        profile_data["friends"] = friends
+        total_friends, friends_names, friends_links, friends_status, friends_in_game = extract_friends(soup)
         profile_data["total_friends"] = total_friends
+        profile_data["friends_names"] = friends_names
+        profile_data["friends_links"] = friends_links
+        profile_data["friends_status"] = friends_status
+        profile_data["friends_in_game"] = friends_in_game
+        
 
         # Extract Years of Service badge
         profile_data["date_of_creation"] = extract_years_of_service(soup)
@@ -229,23 +285,27 @@ def save_to_csv(profile_data, filename="steam_profiles.csv"):
             writer = csv.writer(f)
 
             if not file_exists:
-                writer.writerow(['Name', 'Level', 'Country', 'Status', 'Total Games', 
-                               'Total Playtime Hours', 'Total Badges', 'Total Friends',
-                               'Avatar URL', 'Background URL', 'Recent Activity Hours', 'Date of Creation'])
+                writer.writerow(['Name', 'Level', 'Location', 'Status', 'Total Games', 'Total Badges', 'Total Friends',
+                               'Avatar URL', 'Background URL', 'Total Playtime Hours on Recent Games', 'Date of Creation', 'Recent Activity', 'Profile Description', 'Top Friends Names', 'Top Friends Profile Links', 'Top Friends Online Status', 'Top Friends Current Game Playing (if any)'])
 
             writer.writerow([
                 profile_data.get('name'),
                 profile_data.get('level'),
-                profile_data.get('country'),
+                profile_data.get('location'),
                 profile_data.get('status'),
                 profile_data.get('total_games'),
-                profile_data.get('total_playtime_hours_on_recent_games_on_recent_games'),
-                profile_data.get('total_badges'),
+                profile_data.get('number_of_badges'),
                 profile_data.get('total_friends'),
                 profile_data.get('avatar_url'),
                 profile_data.get('background_url'),
-                profile_data.get('recent_activity_hours'),
-                profile_data.get('date_of_creation')
+                profile_data.get('total_playtime_hours_on_recent_games'),
+                profile_data.get('date_of_creation'),
+                profile_data.get('recent_activity'),
+                profile_data.get('profile_description'),
+                profile_data.get('friends_names'),
+                profile_data.get('friends_links'),
+                profile_data.get('friends_status'),
+                profile_data.get('friends_in_game'),
             ])
     except Exception as e:
         logging.error(f"Error saving to CSV: {e}")
